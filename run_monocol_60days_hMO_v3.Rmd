@@ -1,0 +1,947 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Run Monocol 3 on 60 days midbrain organoids
+
+
+```{r}
+
+library(Seurat)
+library(reticulate)
+library(Matrix)
+library(dplyr)
+library(cowplot)
+library(ggplot2)
+library(dplyr)
+library(DESeq2)
+library(monocle3)
+library(SeuratWrappers)
+
+
+
+
+```
+
+
+Read in the data
+
+```{r}
+
+outpath <- "/Users/rhalenathomas/Documents/Data/scRNAseq/AIWtrio60days/pseudotimeanalysis/"
+
+
+seu.60 <- readRDS("/Users/rhalenathomas/Documents/Data/scRNAseq/AIWtrio60days/AWI002ParkinKOPinkKO60days_labels_14052022.rds")
+DefaultAssay(seu.60) <- "RNA"
+
+
+```
+
+
+I'm going to subset out the control 60 days only
+
+```{r}
+
+Idents(seu.60) <- 'orig.ident'
+unique(seu.60$orig.ident)
+
+aiw <- subset(seu.60, idents = "Control")
+
+DimPlot(aiw, group.by = 'cluster.ids')
+
+# all the cell types are still there 
+
+
+
+```
+
+
+See which cluster were labelled as which cells in the 60days data
+
+```{r}
+
+#cell.key <- as.data.frame(table(seu.60$seurat_clusters,seu.60$cluster.ids)) 
+
+t.lables <- as.data.frame(table(aiw$seurat_clusters,aiw$cluster.ids))
+t.lables$Freq <- as.double(t.lables$Freq)
+
+cell.key <-as.data.frame(t.lables  %>% group_by(Var1)  %>% top_n(1, Freq))
+cell.key
+
+
+```
+
+Re-process the Seurat object
+
+```{r}
+
+aiw <- ScaleData(aiw,verbose = FALSE)
+aiw <- FindVariableFeatures(aiw)
+aiw<- RunPCA(aiw, npcs = 30, verbose = FALSE)
+aiw <- RunUMAP(aiw, reduction = "pca", dims = 1:30)
+
+DimPlot(aiw, reduction = "umap")
+DimPlot(aiw, group.by = "cluster.ids")
+
+```
+
+
+
+
+Make a monocol3 object specifying each section
+
+
+```{r}
+
+# they added gene symbols for short names
+# my short names are the same
+# library("org.Hs.eg.db")
+# gene_symbol <- as.list(org.Hs.egSYMBOL)
+
+# ******* FIX GENE SHORT NAMES FOR LATER *********
+# get the expression matrix from seurat object
+expression_matrix <- GetAssayData(aiw, assay = "integrated", slot = "data")
+raw_matrix <- GetAssayData(aiw, assay = "RNA", slot = "counts")
+
+cell_info <- aiw@meta.data
+gene_name <- raw_matrix@Dimnames[[1]]
+gene_name <- sapply(gene_name, function(x) x[[1]][1])
+
+
+# prepare for the monocle3 object
+gene_name2 <- ifelse(is.na(gene_name), names(gene_name),gene_name)
+gene_short_name <- gene_name2  # it is important to create this dataslot for later
+gene_id <- rownames(raw_matrix)
+
+genes_info <- cbind(gene_id, gene_short_name)
+rownames(genes_info) <- rownames(raw_matrix)
+
+
+cds <- new_cell_data_set(expression_data = raw_matrix, 
+                         cell_metadata = cell_info, 
+                         gene_metadata = genes_info)
+
+
+cds 
+
+# now the meta data is under colData 
+
+
+
+
+```
+
+Run the monocle UMAP 
+
+```{r}
+
+cds <- preprocess_cds(cds, method = "PCA", num_dim = 30, norm_method = "log")
+plot_pc_variance_explained(cds)
+
+# matching the conditions I used in seurat dim = 1:30, default knn = 30L
+cds <- reduce_dimension(cds, reduction_method = "UMAP",umap.n_neighbors = 30L, preprocess_method = "PCA")
+plot_cells(cds)
+
+
+```
+
+Look at some genes
+
+```{r}
+
+plot_cells(cds, genes = c("TH","S100B","MAP2","CALB1"))
+
+
+
+```
+
+
+
+
+
+Now we can plot coloured by a metadata
+
+```{r}
+
+plot_cells(cds, color_cells_by = "cluster.ids")
+plot_cells(cds, color_cells_by = "cluster.ids",
+           label_cell_groups = TRUE,label_principal_points = FALSE,
+           label_branch_points=FALSE,
+            show_trajectory_graph=FALSE,
+           label_leaves=FALSE,
+           group_label_size = 5)
+plot_cells(cds, color_cells_by = "seurat_clusters")
+plot_cells(cds, color_cells_by = "orig.ident")
+
+colnames(cds@colData)
+
+pdf(paste(outpath,"UMAPwithclusterids.pdf"), width = 10, height = 6)
+plot_cells(cds, color_cells_by = "cluster.ids", 
+           label_cell_groups = FALSE, label_branch_points = FALSE,
+           label_principal_points = FALSE,
+            show_trajectory_graph=FALSE,
+           label_leaves=FALSE)
+dev.off()
+
+
+```
+
+
+```{r}
+# seurat UMAP
+
+DimPlot(seu.60, group.by = 'cluster.ids')
+DimPlot(seu.60, group.by = 'cluster.ids',split.by = 'orig.ident')
+
+
+
+
+```
+
+
+I will cluster with the monocol method and see if I'm happier with these cluster
+
+```{r}
+cds <- cluster_cells(cds, k = 75, resolution = 0.06)
+
+
+plot_cells(cds)
+plot_cells(cds, color_cells_by = "partition", group_cells_by = "partition") # partition is larger groups of the smaller clusters 
+plot_cells(cds, color_cells_by = "cluster", group_cells_by = "cluster")
+
+```
+
+Can I get a table with my annotations by cluster id
+
+```{r}
+
+#table(cds@clusters$UMAP$clusters, cds@colData$cluster.ids)
+
+t.lables <- as.data.frame(table(cds@clusters$UMAP$clusters, cds@colData$cluster.ids))
+t.lables$Freq <- as.double(t.lables$Freq)
+
+cell.key.2 <-as.data.frame(t.lables  %>% group_by(Var1)  %>% top_n(1, Freq))
+cell.key.2
+
+# much more similar to the seurat clusters
+
+
+```
+
+I will annotate the cell types from the previous annotation
+
+```{r}
+colData(cds)$assigned_cell_type <- as.character(clusters(cds))
+
+```
+
+
+```{r}
+
+colData(cds)$assigned_cell_type <- dplyr::recode(colData(cds)$assigned_cell_type,
+                                                 "1" = "Dopaminergic Neurons 1 and early DA",
+                                                 "2" = "DA and other Neurons",
+                                                 "3" = "RG 1a",
+                                                 "4" = "RG 1b",
+                                                 "5" = "RG 1c",
+                                                 "6" = "RG 1d",
+                                                 "7" = "RG 1e",
+                                                 "8" = "Dopaminergic Neurons early TH",
+                                                 "9" = "RG 1f",
+                                                 "10" = "Dopaminergic Neurons 1 TH",
+                                                 "11" = "RG 1g",
+                                                 "12" = "NPC and RG",
+                                                 "13" = "RG 1h",
+                                                 "14" = "Astrocytes",
+                                                 "15" = "RG 1i",
+                                                 "16" = "RG and NPC",
+                                                 "17" = "NPC-RG-earlyDA",
+                                                 "18" = "Dopaminergic Neurons 2 and early DA",
+                                                 "19" = "Neural Epithelial",
+                                                 "20" = "NPCs",
+                                                 "21" = "RG 2 astro",
+                                                 "22" = "Dopaminergic Neurons early",
+                                                 )
+                                                 
+plot_cells(cds, group_cells_by = "cluster", color_cells_by = "assigned_cell_type", label_cell_groups = TRUE)
+
+
+```
+
+
+Plot the new cluster labels 
+
+
+
+```{r}
+pdf(paste(outpath,"UMAPwithcellassignments.pdf"), width = 11, height = 6)
+plot_cells(cds, color_cells_by = "assigned_cell_type", 
+           label_cell_groups = FALSE, label_branch_points = FALSE,
+           label_principal_points = FALSE,
+            show_trajectory_graph=FALSE,
+           label_leaves=FALSE)
+dev.off()
+
+
+plot_cells(cds, color_cells_by = "assigned_cell_type", 
+           label_cell_groups = FALSE, label_branch_points = FALSE,
+           label_principal_points = FALSE,
+            show_trajectory_graph=FALSE,
+           label_leaves=FALSE)
+
+plot_cells(cds, color_cells_by = "assigned_cell_type", 
+           label_cell_groups = TRUE, label_branch_points = FALSE,
+           label_principal_points = FALSE,
+            show_trajectory_graph=FALSE,
+           label_leaves=FALSE, group_label_size = 5)
+
+
+```
+
+
+
+
+
+
+Now learn the trajectory graph
+
+```{r}
+
+cds <- learn_graph(cds)
+plot_cells(cds,
+           color_cells_by = "assigned_cell_type",
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE)
+
+
+
+plot_cells(cds,
+           color_cells_by = "assigned_cell_type",
+           label_leaves=FALSE,
+           label_branch_points=TRUE,
+           label_cell_groups = FALSE)
+
+
+
+plot_cells(cds,
+           color_cells_by = "assigned_cell_type",
+           label_leaves=TRUE,
+           label_branch_points=TRUE,
+           label_cell_groups = FALSE,
+           graph_label_size = 3)
+
+
+#pdf(paste(outpath,"UMAPtrajectoryBranchLeaf.pdf"), width = 9, height = 3)
+#plot_cells(cds,
+         #  color_cells_by = "assigned_cell_type",
+         #  label_leaves=TRUE,
+         #  label_branch_points=TRUE,
+         #  label_cell_groups = FALSE,
+         #  graph_label_size = 3)
+#dev.off()
+
+
+```
+
+This graph above will be used in downstream steps
+
+
+It also seems the trajectory is set on top of the UMAP and thus the settings of the UMAP will change the output.
+Lines are not connected across partions - I need to play with the clustering to change them
+
+
+
+Now I will be choosing root nodes
+
+I need to see the cell types again
+
+```{r}
+
+plot_cells(cds,
+           color_cells_by = "assigned_cell_type",
+           label_cell_groups=FALSE,
+           label_leaves=TRUE,
+           label_branch_points=TRUE,
+           graph_label_size=3)
+```
+
+
+
+Save the monocole object 
+
+```{r}
+saveRDS(cds, paste(outpath,"CDSmonocle3_AIWcontrol.RDS",sep = ""))
+
+```
+
+
+
+```{r}
+cds <- order_cells(cds)
+
+```
+
+
+
+Now I plot the cells coloured by pseudotime
+
+```{r}
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=3)
+
+
+pdf(paste(outpath,"PseudotimeUMAP.pdf", sep=""), width = 9, height = 5)
+plot_cells(cds,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=3)
+dev.off()
+
+
+
+```
+
+
+Subset cells based on their trajectory
+
+```{r}
+cds_sub_TH <- choose_graph_segments(cds)
+
+```
+
+
+Working with 3D trajectories
+
+
+```{r}
+cds_3d <- reduce_dimension(cds, max_components = 3)
+cds_3d <- cluster_cells(cds_3d)
+cds_3d <- learn_graph(cds_3d)
+
+
+cds_3d <- order_cells(cds_3d)
+
+
+```
+
+
+```{r}
+
+cds_3d_plot_obj <- plot_cells_3d(cds_3d, color_cells_by="partition")
+cds_3d_plot_obj
+
+plot_cells_3d(cds_3d, color_cells_by="cluster.ids")
+
+install.packages("htmlwidgets")
+library("htmlwidgets")
+
+saveWidget(widget = cds_3d_plot_obj,
+        file = "/Users/rhalenathomas/Documents/Data/scRNAseq/AIWtrio60days/pseudotimeanalysis/pseudotime3DUMAP.html", 
+                selfcontained = TRUE #creates a single html file
+                )
+
+
+
+
+
+
+```
+
+Finding genes that change as a function of pseudotime
+
+Once again, we turn to graph_test(), this time passing it neighbor_graph="principal_graph", which tells it to test whether cells at similar positions on the trajectory have correlated expression:
+
+```{r}
+
+cds_pr_test_res <- graph_test(cds, neighbor_graph="principal_graph", cores=4)
+pr_deg_ids <- row.names(subset(cds_pr_test_res, q_value < 0.05))
+
+
+
+```
+
+
+Have a look at the experssion of some of the gene changing in pseudotime
+
+
+```{r}
+
+p1 <- plot_cells(cds, genes=c("STMN2", "DCX", "MKI67", "TPBG"),
+           show_trajectory_graph=FALSE,
+           label_cell_groups=FALSE,
+           label_leaves=FALSE)
+
+p2 <- plot_cells(cds, genes=c("INA", "NR2F1", "PBK", "NSG2"),
+           show_trajectory_graph=FALSE,
+           label_cell_groups=FALSE,
+           label_leaves=FALSE)
+
+
+p1
+p2
+
+
+
+
+plot_cells(cds, genes=c("EEF1A1","RPL41","RPS12","NRXN1"),
+           show_trajectory_graph=FALSE,
+           label_cell_groups=FALSE,
+           label_leaves=FALSE)
+
+plot_cells(cds, genes=c("PBK","VIM","UBE2C","IGFBP7"),
+           show_trajectory_graph=FALSE,
+           label_cell_groups=FALSE,
+           label_leaves=FALSE)
+
+
+
+
+```
+
+Collect the genes into modules
+
+```{r}
+
+gene_module_df <- find_gene_modules(cds[pr_deg_ids,], resolution=c(10^seq(-6,-1)))
+
+
+
+```
+
+
+
+```{r}
+cell_group_df <- tibble::tibble(cell=row.names(colData(cds)), 
+                                cell_group=colData(cds)$assigned_cell_type)
+agg_mat <- aggregate_gene_expression(cds, gene_module_df, cell_group_df)
+row.names(agg_mat) <- stringr::str_c("Module ", row.names(agg_mat))
+
+pheatmap::pheatmap(agg_mat,
+                   scale="column", clustering_method="ward.D2")
+
+
+
+pdf(paste(outpath,"celltypeGeneMod.pdf", sep = ""), width =6, height = 8)
+pheatmap::pheatmap(agg_mat,
+                   scale="column", clustering_method="ward.D2") + theme(axis.text.x = element_text(size = 50))
+
+dev.off()
+
+
+
+```
+
+
+We can look at the modules and see which ones are associated with a specific cell type.
+
+```{r}
+
+# m 69, 72,64, 8, 30 asc with RG 1f also with oseom other RG /NPC groups
+# mode 23 strong RG1 g and e
+
+# mode 34 DA and other neurons
+# RG 1h and b mod 15
+
+# mode 12 DA early  and also in the TH neuron
+# mode  78  DA early and RG 1i
+# mode  51      RG1i
+
+# mode 80 NPC also linked epi
+
+# mod 38 astrocytes
+
+# DA TH groups  mod 11, 48, 39 
+# m 63 up in later TH neurons
+
+
+# comparing different DA neurons
+
+plot_cells(cds,
+           genes=gene_module_df %>% filter(module %in% c(11, 48, 39, 63)),
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+
+
+
+plot_cells(cds,
+           genes=gene_module_df %>% filter(module %in% c(8,23,51,38)),
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+
+
+
+```
+
+Another way to see the genes 
+
+
+
+Monocle offers another plotting function that can sometimes give a clearer view of a gene's dynamics along a single path. You can select a path with choose_cells() or by subsetting the cell data set by cluster, cell type, or other annotation that's restricted to the path. Let's pick one such path, the AFD cells:
+
+```{r}
+
+
+module23 <- gene_module_df %>% filter(module %in% 23)
+# SLC38A11 ELOVL7  PCYT1B  KCNQ1
+
+# other modules different in RG
+mod15 <- gene_module_df %>% filter(module %in% 15)  # HES4 WNT4
+mod55 <- gene_module_df %>% filter(module %in% 55)   # NEXN  LMX1A
+
+
+cds_sub <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% c("Dopaminergic Neurons early" )]
+
+unique(cds@colData$assigned_cell_type)
+#unique(cds@colData$cluster.ids)
+
+
+# define subgroups 
+
+da.sub <- c("Dopaminergic Neurons 2 and early DA", "Dopaminergic Neurons 1 TH", "Dopaminergic Neurons early TH",
+            "DA and other Neurons","Dopaminergic Neurons 1 and early DA")
+rg.sub <- c("RG 1a","RG 1b","RG 1c", "RG 1d","RG 1e","RG 1f", "RG 1g", "RG 1h", "RG 1i", "RG 1j",
+            "NPC and RG","RG and NPC")
+
+genesoi <- c("SLC38A11", "ELOVL7","PCYT1B", "KCNQ1")
+genesoi <- c("TPBG")
+genesoi <- c("WNT4")
+genesoi <- c("VIM")
+
+genesoi <- c("RTN1") # flat line
+
+genesoi <- c("CD9")
+cds_sub.cd9 <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% rg.sub]
+genesoi <- c("VIM")
+cds_sub.vim <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% rg.sub]
+
+genesoi <- c("TOP2A")
+genesoi <- c("SPARC")
+cds_sub <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% rg.sub]
+
+
+genesoi <- c("DCX")
+cds_sub.dcx <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% da.sub]
+genesoi <- c("STMN2")
+cds_sub.stmn2 <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% da.sub]
+genesoi <- c("NR2F1")
+cds_sub.nr2f1 <- cds[rowData(cds)$gene_id %in% genesoi,
+                       colData(cds)$assigned_cell_type %in% da.sub]
+
+
+
+```
+
+The function plot_genes_in_pseudotime() takes a small set of genes and shows you their dynamics as a function of pseudotime:
+
+
+```{r}
+
+plot_genes_in_pseudotime(cds_sub.vim, color_cells_by = "assigned_cell_type", min_expr = 0.5) # vim
+plot_genes_in_pseudotime(cds_sub.cd9, color_cells_by = "assigned_cell_type", min_expr = 0.5) # cd9
+plot_genes_in_pseudotime(cds_sub, color_cells_by = "assigned_cell_type", min_expr = 0.5)
+
+plot_genes_in_pseudotime(cds_sub.nr2f1, color_cells_by = "assigned_cell_type", min_expr = 0.5)
+plot_genes_in_pseudotime(cds_sub.dcx, color_cells_by = "assigned_cell_type", min_expr = 0.5)
+plot_genes_in_pseudotime(cds_sub.stmn2, color_cells_by = "assigned_cell_type", min_expr = 0.5)
+
+# I believe the plots don't split by gene becasue the gene_short_name isn't added proporly 
+
+
+```
+
+
+Analyze subbranch trajectories
+
+```{r}
+
+
+cds_subset.rg <- choose_cells(cds)
+
+
+```
+
+
+And then calling graph_test() on the subset. This will identify genes with interesting patterns of expression that fall only within the region of the trajectory you selected, giving you a more refined and relevant set of genes.
+
+```{r}
+
+subset_pr_test_res.rg <- graph_test(cds_subset.rg, neighbor_graph="principal_graph", cores=4)
+pr_deg_ids.rg <- row.names(subset(subset_pr_test_res.rg, q_value < 0.05))
+
+
+```
+
+
+Grouping these genes into modules can reveal fate specific genes or those that are activate immediate prior to or following the branch point:
+
+```{r}
+gene_module_df.rg <- find_gene_modules(cds_subset.rg[pr_deg_ids.rg,], resolution=0.001)
+
+
+```
+
+
+We will organize the modules by their similarity (using hclust) over the trajectory so it's a little easier to see which ones come on before others:
+
+```{r}
+agg_mat <- aggregate_gene_expression(cds_subset.rg, gene_module_df.rg)
+module_dendro <- hclust(dist(agg_mat))
+gene_module_df.rg$module <- factor(gene_module_df.rg$module, 
+                                levels = row.names(agg_mat)[module_dendro$order])
+
+plot_cells(cds_subset.rg,
+           genes=gene_module_df.rg,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+
+
+# check out some genes
+
+
+
+
+
+```
+
+
+Check for genes within modules
+
+```{r}
+
+mod1 <-gene_module_df.rg %>% filter(module %in% 1)
+mod1.genes <- mod1[1:20,1]
+
+mod1.gene.v <- as.vector(mod1.genes)
+
+
+
+```
+
+Look at these genes in pseudotime
+
+
+
+```{r}
+
+
+#cds_sub <- cds_subset.rg[rowData(cds_subset.rg)$gene_id %in% mod1.genes$id] # top 20 genes
+
+#genesoi <- c("CCNL2")
+
+g.list <- c("RERE","SPEN","PUM1")
+
+for (g in g.list){
+  cds_sub <- cds_subset.rg[rowData(cds_subset.rg)$gene_id %in% g]
+  print(plot_genes_in_pseudotime(cds_sub, color_cells_by = "assigned_cell_type", min_expr = 0.5))
+  print(g)
+}
+
+
+g = "RERE" # curve
+g = "SPEN"
+g = "PUM1"
+cds_sub <- cds_subset.rg[rowData(cds_subset.rg)$gene_id %in% g]
+  print(plot_genes_in_pseudotime(cds_sub, color_cells_by = "assigned_cell_type", min_expr = 0.5))
+
+
+```
+
+
+See these genes one the UMAP
+
+
+
+```{r}
+plot_cells(cds_subset.rg,
+           genes=g.list,
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+
+
+
+
+
+
+```
+
+
+
+What is we used a different root area?  
+Choosing the dividing cells?
+
+```{r}
+
+plot_cells(cds, genes = c("MKI67","TOP2A"), label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+
+plot_cells(cds, genes = c("MKI67","TOP2A"),
+           show_trajectory_graph=FALSE, color_cells_by = "assigned_cell_type", label_cell_groups = TRUE)
+
+
+
+
+
+```
+
+Have a look in the RG1 subset for ipsc or stem cell markers
+
+
+```{r}
+
+plot_cells(cds_subset.rg,
+           genes= c("MKI67","TOP2A"),
+           label_cell_groups=FALSE,
+           show_trajectory_graph=FALSE)
+
+plot_cells(cds_subset.rg,
+           genes= c("TOP2A"),
+           label_cell_groups=FALSE,
+           show_trajectory_graph=TRUE)
+
+plot_cells(cds_subset.rg,
+           genes= c("TOP2A"),
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = TRUE)
+
+
+# check some other iPSC markers
+# FUT4 is SSEA1
+
+stem <- c("AP","CD9","FUT4","FUT2")
+pluri <- c("POU5F1","SOX2","NANOG","KLF4")
+# OCT4 = POU5F1
+stem.p <- c("TRA1","SOX9","SOX2")
+div <- c("MKI67","PCNA","TOP2A", "MYC")
+
+plot_cells(cds_subset.rg,
+           genes= stem,
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = TRUE)
+
+
+plot_cells(cds,
+           genes= stem,
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = TRUE)
+
+plot_cells(cds,
+           genes= stem,
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = FALSE)
+
+plot_cells(cds,
+           genes= stem.p,
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = FALSE)
+
+plot_cells(cds,
+           genes= pluri,
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = FALSE)
+
+plot_cells(cds,
+           genes= div,
+           show_trajectory_graph=FALSE,color_cells_by = "assigned_cell_type", label_cell_groups = FALSE)
+
+
+```
+
+
+Try pseudotime selecting different start points
+
+```{r}
+
+cds2 <- cds
+
+cds2 <- order_cells(cds2)
+
+# selecting RG1 f tip 
+
+
+```
+
+
+
+```{r}
+plot_cells(cds2,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=3)
+```
+
+```{r}
+
+cds2 <- order_cells(cds2)
+# choose RG1 f tip and RG2 as two start points and NPC and RG as another point
+
+
+```
+
+```{r}
+plot_cells(cds2,
+           color_cells_by = "pseudotime",
+           label_cell_groups=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           graph_label_size=3)
+```
+
+This is more sensible in trying to align pseudo time with developmental time
+Check some of the other factors.
+
+```{r}
+cds_pr_test_res2 <- graph_test(cds2, neighbor_graph="principal_graph", cores=4)
+pr_deg_ids2 <- row.names(subset(cds_pr_test_res2, q_value < 0.05))
+
+```
+
+
+See if the same genes are identified
+
+```{r}
+
+plot_cells(cds, genes=c("EEF1A1","RPL41","RPS12","NRXN1"),
+           show_trajectory_graph=FALSE,
+           label_cell_groups=FALSE,
+           label_leaves=FALSE)
+
+```
+
+
+
+
+
+
+
+
+Add the monocle cell ids into the seurat object
+
+
+```{r}
+
+
+aiw <- AddMetaData(aiw, cds@colData$assigned_cell_type, col.name = "mon.cell.ids")
+
+saveRDS(aiw, "/Users/rhalenathomas/Documents/Data/scRNAseq/AIWtrio60days/AIWcontrolNov28.RDS")
+ 
+
+```
+
+
+
+
+
+
+
+
+
